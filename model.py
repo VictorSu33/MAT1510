@@ -101,7 +101,7 @@ class TransformerLayer(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         # Pre-LN attention block.
         normalized_x = self.norm1(x)
 
@@ -109,7 +109,7 @@ class TransformerLayer(nn.Module):
         k = self.k_proj(normalized_x)
         v = self.v_proj(normalized_x)
 
-        attention_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attention_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
         x = x + self.out_proj(attention_output)
         x = x + self.ffn(self.norm2(x))
@@ -118,7 +118,7 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model: int, depth: int, initialization: str = "orthogonal"):
+    def __init__(self, d_model: int, depth: int, initialization: str = "orthogonal", window_size: int = 0):
         super().__init__()
 
         self.d_model = d_model
@@ -135,6 +135,9 @@ class Transformer(nn.Module):
             d_model,
             elementwise_affine=False,
         )
+
+        self.window_size = window_size
+
 
     def forward(self, x, apply_final_norm: bool = False):
         """
@@ -153,8 +156,9 @@ class Transformer(nn.Module):
 
         hidden_states = x + pe
 
+        mask = construct_mask(seq_len, window_size=self.window_size, device = x.device, dtype=x.dtype)
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states, mask)
 
         # V^(L) final layer representation.
         if not apply_final_norm:
@@ -162,3 +166,31 @@ class Transformer(nn.Module):
 
         # y = LN_final(V^(L)).
         return self.final_norm(hidden_states)
+
+def construct_mask(
+    seq_len: int,
+    window_size: int  = 0,
+    device=None,
+    dtype=None,
+):
+    query_pos = torch.arange(seq_len, device=device)[:, None]
+    key_pos = torch.arange(seq_len, device=device)[None, :]
+
+    causal = key_pos <= query_pos
+
+    if window_size == 0:
+        allowed = causal
+    else:
+
+        local = (query_pos - key_pos) < window_size
+        allowed = causal & local
+
+    # Additive attention mask: 0 allowed -inf masked
+    mask = torch.full(
+        (seq_len, seq_len),
+        float("-inf"),
+        device=device,
+        dtype=dtype,
+    )
+
+    return mask.masked_fill(allowed, 0.0)
